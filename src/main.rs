@@ -389,17 +389,84 @@ fn merge_paths(primary: &str, secondary: &str) -> String {
         .join(":")
 }
 
-/// The PATH out of a shell run for it: the last non-empty line, because an
-/// rc that greets the user prints above the `echo $PATH`.
+/// Brackets the PATH in the probe's output. An interactive rc prints what it
+/// likes — a greeting above, an exit hook below — so neither the whole output
+/// nor any one line of it can be trusted to be the PATH.
 #[cfg(unix)]
-fn path_from_shell_output(out: &[u8]) -> String {
-    String::from_utf8_lossy(out)
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .next_back()
-        .unwrap_or_default()
-        .to_string()
+const PATH_MARKER: &str = "__TTY7_PATH__";
+
+/// How long startup waits on the user's rc files before giving up on them.
+#[cfg(unix)]
+const PATH_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The PATH between the first pair of markers, or `None` until both are in.
+#[cfg(unix)]
+fn path_from_shell_output(out: &[u8]) -> Option<String> {
+    let out = String::from_utf8_lossy(out);
+    let (_, rest) = out.split_once(PATH_MARKER)?;
+    let (path, _) = rest.split_once(PATH_MARKER)?;
+    Some(path.trim().to_string())
+}
+
+/// Runs the probe and returns the PATH as soon as the closing marker arrives,
+/// without waiting for EOF: an rc that backgrounds a daemon hands it our
+/// stdout, and the pipe then never closes. Past the timeout the shell is
+/// killed and startup goes on with the PATH it has.
+#[cfg(unix)]
+fn read_path_from_shell(shell: &str, args: &[&str]) -> Option<String> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+
+    let mut child = match Command::new(shell)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            log::warn!("failed to spawn login shell {shell} for PATH: {e}");
+            return None;
+        }
+    };
+    let mut stdout = child.stdout.take()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut out = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            match stdout.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => out.extend_from_slice(&buf[..n]),
+            }
+            if let Some(path) = path_from_shell_output(&out) {
+                let _ = tx.send(Some(path));
+                return;
+            }
+        }
+        let _ = tx.send(None);
+    });
+    let path = match rx.recv_timeout(PATH_PROBE_TIMEOUT) {
+        Ok(path) => path,
+        Err(_) => {
+            log::warn!(
+                "login shell {shell} did not report PATH within {PATH_PROBE_TIMEOUT:?}; \
+                 continuing without it"
+            );
+            let _ = child.kill();
+            None
+        }
+    };
+    if path.is_none() {
+        let _ = child.kill();
+    }
+    // Reap off the startup path: after the marker the shell may still be
+    // running exit hooks, and none of them is worth a delay here.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    path
 }
 
 #[cfg(unix)]
@@ -407,9 +474,9 @@ fn enrich_path_from_login_shell() {
     let shell = crate::core::shells::login_shell();
     let fish = std::path::Path::new(&shell).file_name() == Some("fish".as_ref());
     let cmd = if fish {
-        "string join ':' $PATH"
+        format!("printf '{PATH_MARKER}%s{PATH_MARKER}' (string join ':' $PATH)")
     } else {
-        "echo $PATH"
+        format!("printf '{PATH_MARKER}%s{PATH_MARKER}' \"$PATH\"")
     };
     // A pane gets an interactive shell, and for zsh/bash that is the only one
     // that reads `.zshrc` / `.bashrc` — where most people put their PATH. A
@@ -418,22 +485,13 @@ fn enrich_path_from_login_shell() {
     // do not exist as far as this app is concerned. fish reads its config in
     // every mode; `-i` without a tty only makes it complain on stderr.
     let args: Vec<&str> = if fish {
-        vec!["-l", "-c", cmd]
+        vec!["-l", "-c", &cmd]
     } else {
-        vec!["-i", "-l", "-c", cmd]
+        vec!["-i", "-l", "-c", &cmd]
     };
-    let out = match std::process::Command::new(&shell).args(&args).output() {
-        Ok(out) if out.status.success() => out.stdout,
-        Ok(out) => {
-            log::warn!("login shell exited with {} while reading PATH", out.status);
-            return;
-        }
-        Err(e) => {
-            log::warn!("failed to spawn login shell {shell} for PATH: {e}");
-            return;
-        }
+    let Some(login_path) = read_path_from_shell(&shell, &args) else {
+        return;
     };
-    let login_path = path_from_shell_output(&out);
     if login_path.is_empty() {
         return;
     }
@@ -629,13 +687,15 @@ fn main() {
         return;
     }
 
-    #[cfg(unix)]
-    enrich_path_from_login_shell();
-
     let open_path = open_path_from(args.into_iter());
     if forward_open_path(open_path.as_deref()) {
         return;
     }
+
+    // After the forward: a launch that only hands a path to the running
+    // window has no use for the PATH, and running the user's rc costs time.
+    #[cfg(unix)]
+    enrich_path_from_login_shell();
 
     // A package the user asked to have applied at the next launch. Deliberately
     // here: after the forward above, so a second launch that is really a
@@ -938,13 +998,23 @@ mod tests {
     use super::{merge_paths, path_from_shell_output};
 
     #[test]
-    fn path_from_shell_output_takes_the_last_non_empty_line() {
-        // The shape `zsh -i` actually prints: an rc that greets the user, and
-        // the `can't change option: zle` chatter `-i` earns without a tty.
+    fn path_from_shell_output_reads_between_the_markers() {
+        // The shape `zsh -i` actually prints: an rc that greets the user, the
+        // `can't change option: zle` chatter `-i` earns without a tty, and an
+        // exit hook that prints after the PATH.
         assert_eq!(
-            path_from_shell_output(b"hello\n(eval):1: can't change option: zle\n/opt/bin:/usr/bin\n"),
-            "/opt/bin:/usr/bin"
-        )
+            path_from_shell_output(
+                b"hello\n(eval):1: can't change option: zle\n\
+                  __TTY7_PATH__/opt/bin:/usr/bin__TTY7_PATH__bye\n"
+            )
+            .as_deref(),
+            Some("/opt/bin:/usr/bin")
+        );
+        assert_eq!(
+            path_from_shell_output(b"hello\n__TTY7_PATH__/opt/bin"),
+            None
+        );
+        assert_eq!(path_from_shell_output(b"/opt/bin:/usr/bin\n"), None);
     }
 
     #[test]
