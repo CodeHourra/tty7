@@ -389,18 +389,40 @@ fn merge_paths(primary: &str, secondary: &str) -> String {
         .join(":")
 }
 
+/// The PATH out of a shell run for it: the last non-empty line, because an
+/// rc that greets the user prints above the `echo $PATH`.
+#[cfg(unix)]
+fn path_from_shell_output(out: &[u8]) -> String {
+    String::from_utf8_lossy(out)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .next_back()
+        .unwrap_or_default()
+        .to_string()
+}
+
 #[cfg(unix)]
 fn enrich_path_from_login_shell() {
     let shell = crate::core::shells::login_shell();
-    let cmd = if std::path::Path::new(&shell).file_name() == Some("fish".as_ref()) {
+    let fish = std::path::Path::new(&shell).file_name() == Some("fish".as_ref());
+    let cmd = if fish {
         "string join ':' $PATH"
     } else {
         "echo $PATH"
     };
-    let out = match std::process::Command::new(&shell)
-        .args(["-l", "-c", cmd])
-        .output()
-    {
+    // A pane gets an interactive shell, and for zsh/bash that is the only one
+    // that reads `.zshrc` / `.bashrc` — where most people put their PATH. A
+    // login shell alone reads `.zprofile` / `.bash_profile` and quietly hands
+    // back the GUI's own bare PATH, so half the tools on `PATH` in a terminal
+    // do not exist as far as this app is concerned. fish reads its config in
+    // every mode; `-i` without a tty only makes it complain on stderr.
+    let args: Vec<&str> = if fish {
+        vec!["-l", "-c", cmd]
+    } else {
+        vec!["-i", "-l", "-c", cmd]
+    };
+    let out = match std::process::Command::new(&shell).args(&args).output() {
         Ok(out) if out.status.success() => out.stdout,
         Ok(out) => {
             log::warn!("login shell exited with {} while reading PATH", out.status);
@@ -411,7 +433,7 @@ fn enrich_path_from_login_shell() {
             return;
         }
     };
-    let login_path = String::from_utf8_lossy(&out).trim().to_string();
+    let login_path = path_from_shell_output(&out);
     if login_path.is_empty() {
         return;
     }
@@ -913,7 +935,17 @@ mod config_reload_tests {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::merge_paths;
+    use super::{merge_paths, path_from_shell_output};
+
+    #[test]
+    fn path_from_shell_output_takes_the_last_non_empty_line() {
+        // The shape `zsh -i` actually prints: an rc that greets the user, and
+        // the `can't change option: zle` chatter `-i` earns without a tty.
+        assert_eq!(
+            path_from_shell_output(b"hello\n(eval):1: can't change option: zle\n/opt/bin:/usr/bin\n"),
+            "/opt/bin:/usr/bin"
+        )
+    }
 
     #[test]
     fn merge_paths_prefers_primary_dedupes_and_drops_empties() {
