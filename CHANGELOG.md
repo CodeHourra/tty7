@@ -289,8 +289,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `NEW Agent Tab` menu, and a matching `agent_launch` entry did not help,
   because the override's own program is looked up on the same `PATH`. The probe
   now runs interactively (`-i -l`, fish unchanged — it reads its config in
-  every mode) and takes the last non-empty line of the output, so an `rc` that
-  greets the user cannot be mistaken for the PATH.
+  every mode), reads the PATH between markers so an `rc` that prints cannot be
+  mistaken for it, and gives up after 5 seconds so a stuck `rc` cannot keep
+  the app from opening.
 
 - **Chinese UI copy reads like Chinese** (#980). Half-width `?` and `,` in the
   hard-reset confirmation, the passphrase, Finder and server naming used two
